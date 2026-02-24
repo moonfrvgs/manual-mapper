@@ -99,6 +99,7 @@ public:
                 continue;
 
             if (get_process_id(hijack) == target_process_id) {
+                std::cout << std::dec << (int)client_id.UniqueProcess << "\n";
                 std::cout << "[+] hijacked from target handle: 0x" << std::hex << entry.Handle << " now mapped in our process as: 0x" << reinterpret_cast<uintptr_t>(hijack) << "\n";
                 close_handle(handle);
                 handle = nullptr;
@@ -161,6 +162,25 @@ namespace pe {
 };
 
 namespace memory {
+
+    uint64_t retrieve_process_peb(_In_ void* process_permissions) {
+        PROCESS_BASIC_INFORMATION pbi; NTSTATUS status = 0; DWORD return_length = 0; PEB local;
+        auto nt_query_system_information_process = reinterpret_cast<NtQueryInformationProcess>(resolve_address("NtQueryInformationProcess"));
+        status = nt_query_system_information_process(process_permissions, ProcessBasicInformation, &pbi, sizeof(pbi), &return_length);
+        if (!NT_SUCCESS(status)) {
+            std::cout << "[-] failed retrieving peb";
+            return 0x0;
+        }
+
+        if (reinterpret_cast<std::uint64_t>(pbi.PebBaseAddress) != 0) {
+            std::cout << "[+] peb located [" << std::hex << pbi.PebBaseAddress << "]\n";
+            return reinterpret_cast<uint64_t>(pbi.PebBaseAddress);
+        }
+    }
+
+
+
+
     dword get_process_id(_In_ std::string_view window_name) {
         auto window = ::find_window(null, window_name.data()); dword process_id = 0;
         if (!::get_window_thread_process_id(window, &process_id)) {
@@ -261,6 +281,7 @@ bool manual_map(_In_ std::string_view process_window_name, _In_ const char* dll_
         container::error_handler("[-] Error opening dll");
     }
     std::cout << "[+] opening dll\n";
+
 
     std::streamsize dll_size = file.tellg();
     std::unique_ptr<std::byte[]> dll_data = std::make_unique<std::byte[]>(dll_size);
@@ -386,12 +407,12 @@ bool manual_map(_In_ std::string_view process_window_name, _In_ const char* dll_
     auto string_conversion = [&](void* address) -> std::string {
         std::string name = "";
         char character = 0;
-		size_t offset = 0;
+        size_t offset = 0;
 
         while (true) {
-            if(!ReadProcessMemory(hijack.retrieve_handle(), (void*)((byte*)address + offset), &character, sizeof(char), nullptr)) {
+            if (!ReadProcessMemory(hijack.retrieve_handle(), (void*)((byte*)address + offset), &character, sizeof(char), nullptr)) {
                 container::error_handler("[-] couldn't read imported dll name");
-			}
+            }
 
             if (character == '\0')
                 break;
@@ -399,106 +420,172 @@ bool manual_map(_In_ std::string_view process_window_name, _In_ const char* dll_
             name.push_back(character);
             offset++;
         }
-        
+
         return name;
-    };
-    
+        };
 
-	auto import_directory = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if(!import_directory->VirtualAddress || !import_directory->Size) {
+
+    auto import_directory = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!import_directory->VirtualAddress || !import_directory->Size) {
         container::error_handler("[-] no import directory found");
-	}
+    }
 
-	auto remote_descriptor = (IMAGE_IMPORT_DESCRIPTOR*)((byte*)allocation + import_directory->VirtualAddress);
-    IMAGE_IMPORT_DESCRIPTOR local_descriptor {};
+    auto remote_descriptor = (IMAGE_IMPORT_DESCRIPTOR*)((byte*)allocation + import_directory->VirtualAddress);
+    IMAGE_IMPORT_DESCRIPTOR local_descriptor{};
     if (!::ReadProcessMemory(hijack.retrieve_handle(), remote_descriptor, &local_descriptor, sizeof(IMAGE_IMPORT_DESCRIPTOR), nullptr)) {
-		container::error_handler("[-] couldn't read import descriptor");
+        container::error_handler("[-] couldn't read import descriptor");
     }
 
     while (local_descriptor.Name) {
-		std::string dll_name = string_conversion((void*)((byte*)allocation + local_descriptor.Name)); load_dll(dll_name); 
+        std::string dll_name = string_conversion((void*)((byte*)allocation + local_descriptor.Name)); load_dll(dll_name);
         uintptr_t original_first_thunk = (uintptr_t)allocation + local_descriptor.OriginalFirstThunk;
-		uintptr_t first_thunk = (uintptr_t)allocation + local_descriptor.FirstThunk;
+        uintptr_t first_thunk = (uintptr_t)allocation + local_descriptor.FirstThunk;
 
-		IMAGE_THUNK_DATA64 thunk_data{};
+        IMAGE_THUNK_DATA64 thunk_data{};
         if (!::ReadProcessMemory(hijack.retrieve_handle(), (void*)original_first_thunk, &thunk_data, sizeof(IMAGE_THUNK_DATA64), nullptr)) {
-			container::error_handler("[-] couldn't read thunk data");
+            container::error_handler("[-] couldn't read thunk data");
         }
 
         while (thunk_data.u1.AddressOfData) {
             uintptr_t function_adddress = 0;
             if (IMAGE_SNAP_BY_ORDINAL(thunk_data.u1.Ordinal))
             {
-				function_adddress = (uintptr_t)GetProcAddress(LoadLibraryA(dll_name.c_str()), (LPCSTR)(thunk_data.u1.Ordinal & 0xFFFF));
+                function_adddress = (uintptr_t)GetProcAddress(LoadLibraryA(dll_name.c_str()), (LPCSTR)(thunk_data.u1.Ordinal & 0xFFFF));
             }
             else {
-				auto import_by_name = (IMAGE_IMPORT_BY_NAME*)((byte*)allocation + thunk_data.u1.AddressOfData);
-                char buffer[256]; 
+                auto import_by_name = (IMAGE_IMPORT_BY_NAME*)((byte*)allocation + thunk_data.u1.AddressOfData);
+                char buffer[256];
                 if (!::ReadProcessMemory(hijack.retrieve_handle(), import_by_name, &buffer, sizeof(buffer), nullptr)) {
-					std::cout << "[-] couldn't read import by name\n";
+                    std::cout << "[-] couldn't read import by name\n";
                 }
-				function_adddress = (uintptr_t)GetProcAddress(LoadLibraryA(dll_name.c_str()), ((IMAGE_IMPORT_BY_NAME*)buffer)->Name);
+                function_adddress = (uintptr_t)GetProcAddress(LoadLibraryA(dll_name.c_str()), ((IMAGE_IMPORT_BY_NAME*)buffer)->Name);
             }
             if (!::WriteProcessMemory(hijack.retrieve_handle(), (void*)first_thunk, &function_adddress, sizeof(uintptr_t), nullptr)) {
-				std::cout << "[-] couldn't write function address\n";
+                std::cout << "[-] couldn't write function address\n";
             }
-			original_first_thunk += sizeof(IMAGE_THUNK_DATA64);
+            original_first_thunk += sizeof(IMAGE_THUNK_DATA64);
             first_thunk += sizeof(IMAGE_THUNK_DATA64);
 
             if (!::ReadProcessMemory(hijack.retrieve_handle(), (void*)original_first_thunk, &thunk_data, sizeof(IMAGE_THUNK_DATA64), nullptr)) {
-				container::error_handler("[-] couldn't read thunk data");
+                container::error_handler("[-] couldn't read thunk data");
             }
         }
-		remote_descriptor++;
+        remote_descriptor++;
         if (!::ReadProcessMemory(hijack.retrieve_handle(), remote_descriptor, &local_descriptor, sizeof(IMAGE_IMPORT_DESCRIPTOR), nullptr)) {
-			container::error_handler("[-] couldn't read import descriptor");
+            container::error_handler("[-] couldn't read import descriptor");
         }
     }
-    
-   
-	std::cout << "[+] launching dll entry point\n";
+
+
+    std::cout << "[+] launching dll entry point\n";
+    uintptr_t entry_point = (uintptr_t)allocation + opt_header->AddressOfEntryPoint;
+
     struct dll_stub {
         BYTE code[64];
     };
 
     dll_stub stub = {
         {
-            0x48, 0x83, 0xEC, 0x28,              
-            0x48, 0xB9,                    
+            0x48, 0x83, 0xEC, 0x28,
+            0x48, 0xB9,
             0,0,0,0,0,0,0,0,
             0xBA, 0x01, 0x00, 0x00, 0x00,
-            0x4D, 0x31, 0xC0,               
-            0x48, 0xB8,                                  
+            0x4D, 0x31, 0xC0,
+            0x48, 0xB8,
             0,0,0,0,0,0,0,0,
-            0xFF, 0xD0,                             
-            0x48, 0x83, 0xC4, 0x28,                       
-            0xC3                               
+            0xFF, 0xD0,
+            0x48, 0x83, 0xC4, 0x28,
+            0xC3
         }
     };
-    *(uintptr_t*)(stub.code + 6) = (uintptr_t)allocation; 
+    *(uintptr_t*)(stub.code + 6) = (uintptr_t)allocation;
     *(uintptr_t*)(stub.code + 24) = (uintptr_t)allocation + opt_header->AddressOfEntryPoint;
 
-    void* remote_stub = VirtualAllocEx(hijack.retrieve_handle(),nullptr,sizeof(stub),MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-
+    void* remote_stub = VirtualAllocEx(hijack.retrieve_handle(), nullptr, sizeof(stub), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!::WriteProcessMemory(hijack.retrieve_handle(), remote_stub, &stub, sizeof(stub), nullptr)) {
-		container::error_handler("[-] couldn't write remote stub");
+        container::error_handler("[-] couldn't write remote stub");
     }
 
 
+    void* snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE)
+        return 0;
 
-    HANDLE thread = CreateRemoteThread(hijack.retrieve_handle(), nullptr, 0, (LPTHREAD_START_ROUTINE)remote_stub, nullptr, 0, nullptr);
-    if(!thread) {
-        container::error_handler("[-] couldn't create remote thread for dll entry point");
-	}
-    WaitForSingleObject(thread, INFINITE);
-    CloseHandle(thread);
+    THREADENTRY32 thread_entry{};
+    thread_entry.dwSize = sizeof(THREADENTRY32); dword thread_id = 0;
 
-    return true;
+    if (Thread32First(snapshot, &thread_entry))
+    {
+        do
+        {
+            if (thread_entry.th32OwnerProcessID == memory::get_process_id(process_window_name.data()))
+            {
+                CloseHandle(snapshot);
+                thread_id = thread_entry.th32ThreadID;
+            }
+
+        } while (Thread32Next(snapshot, &thread_entry));
+    }
+
+    CloseHandle(snapshot);
+
+    void* thread_handle = OpenThread(THREAD_ALL_ACCESS, FALSE, thread_id);
+    SuspendThread(thread_handle);
+    CONTEXT ctx;
+    ctx.ContextFlags = CONTEXT_FULL;
+    GetThreadContext(thread_handle, &ctx);
+    
+
+    ctx.Rip = (DWORD64)remote_stub;
+    SetThreadContext(thread_handle, &ctx);
+    ResumeThread(thread_handle);
+
+    uintptr_t remote_entry_point{};
+
+    PEB remote_peb{}; PEB_LDR_DATA ldr_local{};
+    if (!::ReadProcessMemory(hijack.retrieve_handle(), reinterpret_cast<void*>(memory::retrieve_process_peb(hijack.retrieve_handle())), &remote_peb, sizeof(remote_peb), nullptr)) {
+        std::cout << "[-] couldn't retrieve process peb";
+    }
+
+    if (!::ReadProcessMemory(hijack.retrieve_handle(), remote_peb.Ldr, &ldr_local, sizeof(ldr_local), nullptr)) {
+        std::cout << "[-] couldn't retrieve ldr";
+    }
+    std::cout << "[+] retrieved ldr [" << std::hex << (uint64_t)remote_peb.Ldr << "]\n";
+    uintptr_t head_remote = reinterpret_cast<uintptr_t>(remote_peb.Ldr) + offsetof(PEB_LDR_DATA, InLoadOrderModuleList);
+    uintptr_t current_remote = reinterpret_cast<uintptr_t>(ldr_local.InLoadOrderModuleList.Flink);
+
+    while (current_remote != head_remote && current_remote != 0) {
+
+        LDR_DATA_TABLE_ENTRY entry{};
+        uintptr_t remote_entry_addr = current_remote - offsetof(LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+
+        if (wcscmp(entry.BaseDllName.Buffer, L"Dll1.dll") == 0) {
+            std::cout << "IN LDR";
+            entry.InLoadOrderLinks.Blink->Flink = entry.InLoadOrderLinks.Flink;
+            entry.InLoadOrderLinks.Flink->Blink = entry.InLoadOrderLinks.Blink;
+
+            entry.InMemoryOrderLinks.Blink->Flink = entry.InMemoryOrderLinks.Flink;
+            entry.InMemoryOrderLinks.Flink->Blink = entry.InMemoryOrderLinks.Blink;
+
+            entry.InInitializationOrderLinks.Blink->Flink = entry.InInitializationOrderLinks.Flink;
+            entry.InInitializationOrderLinks.Flink->Blink = entry.InInitializationOrderLinks.Blink;
+
+            std::wcout << L"deleted: " << entry.BaseDllName.Buffer << std::endl;
+            break;
+        }
+
+        current_remote = reinterpret_cast<uintptr_t>(entry.InLoadOrderLinks.Flink);
+    }
+
+    std::cout << "[+] remote entry point [" << remote_entry_point << "]" << std::endl;
 }
 
-int main() {
-    bool manual_mapper = manual_map("Brawlhalla", "C:\\Users\\cex\\source\\repos\\radical injector\\x64\\Release\\Dll1.dll");
 
+
+int main() {
+    bool manual_mapper = manual_map("Roblox", "C:\\Users\\cex\\source\\repos\\radical injector\\x64\\Release\\Dll1.dll");
+   
+    //handle_hijacker<void*> hijack(memory::get_process_id("Roblox"), PROCESS_ALL_ACCESS);
 }
 
 
