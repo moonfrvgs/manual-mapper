@@ -540,44 +540,6 @@ bool manual_map(_In_ std::string_view process_window_name, _In_ const char* dll_
     SetThreadContext(thread_handle, &ctx);
     ResumeThread(thread_handle);
 
-    uintptr_t remote_entry_point{};
-
-    PEB remote_peb{}; PEB_LDR_DATA ldr_local{};
-    if (!::ReadProcessMemory(hijack.retrieve_handle(), reinterpret_cast<void*>(memory::retrieve_process_peb(hijack.retrieve_handle())), &remote_peb, sizeof(remote_peb), nullptr)) {
-        std::cout << "[-] couldn't retrieve process peb";
-    }
-
-    if (!::ReadProcessMemory(hijack.retrieve_handle(), remote_peb.Ldr, &ldr_local, sizeof(ldr_local), nullptr)) {
-        std::cout << "[-] couldn't retrieve ldr";
-    }
-    std::cout << "[+] retrieved ldr [" << std::hex << (uint64_t)remote_peb.Ldr << "]\n";
-    uintptr_t head_remote = reinterpret_cast<uintptr_t>(remote_peb.Ldr) + offsetof(PEB_LDR_DATA, InLoadOrderModuleList);
-    uintptr_t current_remote = reinterpret_cast<uintptr_t>(ldr_local.InLoadOrderModuleList.Flink);
-
-    while (current_remote != head_remote && current_remote != 0) {
-
-        LDR_DATA_TABLE_ENTRY entry{};
-        uintptr_t remote_entry_addr = current_remote - offsetof(LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
-
-        if (wcscmp(entry.BaseDllName.Buffer, L"Dll1.dll") == 0) {
-            std::cout << "IN LDR";
-            entry.InLoadOrderLinks.Blink->Flink = entry.InLoadOrderLinks.Flink;
-            entry.InLoadOrderLinks.Flink->Blink = entry.InLoadOrderLinks.Blink;
-
-            entry.InMemoryOrderLinks.Blink->Flink = entry.InMemoryOrderLinks.Flink;
-            entry.InMemoryOrderLinks.Flink->Blink = entry.InMemoryOrderLinks.Blink;
-
-            entry.InInitializationOrderLinks.Blink->Flink = entry.InInitializationOrderLinks.Flink;
-            entry.InInitializationOrderLinks.Flink->Blink = entry.InInitializationOrderLinks.Blink;
-
-            std::wcout << L"deleted: " << entry.BaseDllName.Buffer << std::endl;
-            break;
-        }
-
-        current_remote = reinterpret_cast<uintptr_t>(entry.InLoadOrderLinks.Flink);
-    }
-
-    std::cout << "[+] remote entry point [" << remote_entry_point << "]" << std::endl;
 }
 
 
