@@ -1,10 +1,17 @@
 #include "main.h"
+
 #pragma warning(push)
 #pragma warning(disable : 6011)
 #pragma warning(disable : 4312)
 #pragma warning(disable : 6387)
 #pragma warning(disable : 6031)
 
+namespace container {
+    [[noreturn]] void error_handler(_In_ std::string_view message) {
+        MessageBoxA(NULL, message.data(), "Error", MB_OK);
+        exit(-1);
+    };
+}
 template<typename T = void*> requires std::is_same_v<T, void*>
 
 class handle_hijacker {
@@ -74,7 +81,7 @@ public:
             }
         }
 
-  
+
         if (!NT_SUCCESS(status)) {
             exception_handler("[-] querying system handle information failed");
         }
@@ -98,8 +105,8 @@ public:
             if (!NT_SUCCESS(status) || !handle_check(hijack))
                 continue;
 
-            if (get_process_id(hijack) == target_process_id) {
-                std::cout << std::dec << (int)client_id.UniqueProcess << "\n";
+            if (get_process_identifier(hijack) == target_process_id) {
+           //    std::cout << std::dec << (int)client_id.UniqueProcess << "\n";
                 std::cout << "[+] hijacked from target handle: 0x" << std::hex << entry.Handle << " now mapped in our process as: 0x" << reinterpret_cast<uintptr_t>(hijack) << "\n";
                 close_handle(handle);
                 handle = nullptr;
@@ -127,17 +134,6 @@ public:
     }
 };
 
-
-namespace container {
-    [[noreturn]] void error_handler(_In_ std::string_view message) {
-        MessageBoxA(NULL, message.data(), "Error", MB_OK);
-        exit(-1);
-    };
-
-    void print(_In_ const char* message) {
-        std::cout << message << std::endl;
-    };
-}
 namespace pe {
     struct pe_headers {
         image_dos_header* dos_header = nullptr;
@@ -181,7 +177,7 @@ namespace memory {
 
 
 
-    dword get_process_id(_In_ std::string_view window_name) {
+    dword get_process_identifier(_In_ std::string_view window_name) {
         auto window = ::find_window(null, window_name.data()); dword process_id = 0;
         if (!::get_window_thread_process_id(window, &process_id)) {
             std::cout << "[-] error returning process id\n";
@@ -271,28 +267,37 @@ namespace memory {
 
 }
 
-
-
 bool manual_map(_In_ std::string_view process_window_name, _In_ const char* dll_path) {
-    ntstatus status = 0;
-    handle_hijacker<void*> hijack(memory::get_process_id(process_window_name.data()), PROCESS_ALL_ACCESS);
-    std::fstream file(dll_path, std::ios::in | std::ios::binary | std::ios::ate);
-    if (file.fail()) {
-        container::error_handler("[-] Error opening dll");
+    if (process_window_name.empty()) {
+        std::cout << "[-] invalid window name" << std::endl;
+        return false;
     }
-    std::cout << "[+] opening dll\n";
 
+    if (strlen(dll_path) < 1) {
+        std::cout << "[-] invalid dll path";
+        return false;
+    }
 
-    std::streamsize dll_size = file.tellg();
+    dword process_identifier = memory::get_process_identifier(process_window_name);
+
+    if (process_identifier == 0) {
+        std::cout << "[-] couldn't retrieve process id";
+        return false;
+    }
+
+    handle_hijacker<void*> hijack(process_identifier, process_all_access);
+    std::fstream dll_file(dll_path, std::ios::in | std::ios::ate | std::ios::binary);
+    std::streamsize dll_size = dll_file.tellg();
     std::unique_ptr<std::byte[]> dll_data = std::make_unique<std::byte[]>(dll_size);
-    file.seekg(0, std::ios::beg);
-    file.read(reinterpret_cast<char*>(dll_data.get()), dll_size);
 
-    if (!file) {
-        container::error_handler("[-] Error reading dll");
+    dll_file.seekg(0, std::ios::beg);
+    dll_file.read(reinterpret_cast<char*>(dll_data.get()), dll_size);
+
+    if (!dll_file) {
+        std::cout << "[-] error reading dll contents";
+        return false;
     }
-    file.close();
-    std::cout << "[+] read dll bytes\n";
+
     auto allocate_external_memory = [](_In_ void* permissions, _In_ dword access_mask, _In_ size_t allocated_size, _In_ void* preferred_address) -> void* {
         void* memory_allocation = ::VirtualAllocEx(permissions, preferred_address, allocated_size, MEM_COMMIT | MEM_RESERVE, access_mask);
         if (!memory_allocation) {
@@ -302,59 +307,45 @@ bool manual_map(_In_ std::string_view process_window_name, _In_ const char* dll_
             }
         }
         return memory_allocation;
-    };
+        };
 
 
     hmodule dll_module = LoadLibraryEx(dll_path, nullptr, DONT_RESOLVE_DLL_REFERENCES);
-    pe::pe_headers pe_headers = pe::resolve_pe_headers(dll_module);
-    void* allocation = allocate_external_memory(hijack.retrieve_handle(), PAGE_EXECUTE_READWRITE, pe_headers.optional_header->SizeOfImage, (void*)pe_headers.optional_header->ImageBase);
+    pe::pe_headers dll_headers = pe::resolve_pe_headers((void*)dll_module);
+    void* allocation = allocate_external_memory(hijack.retrieve_handle(), PAGE_EXECUTE_READWRITE, dll_headers.optional_header->SizeOfImage, (void*)dll_headers.optional_header->ImageBase);
 
-    if (!WriteProcessMemory(hijack.retrieve_handle(), allocation, dll_module, pe_headers.optional_header->SizeOfHeaders, nullptr)) {
-        container::error_handler("[-] error couldn't write headers");
-    }
-
-
-    auto nt_write_virtual_memory = reinterpret_cast<decltype(&NtWriteVirtualMemory)>(GetProcAddress(GetModuleHandle("ntdll.dll"), "NtWriteVirtualMemory"));
-    const unsigned char* file_base = reinterpret_cast<const unsigned char*>(dll_data.get());
-    IMAGE_DOS_HEADER* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(const_cast<unsigned char*>(file_base));
-    IMAGE_NT_HEADERS64* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(const_cast<unsigned char*>(file_base + dos->e_lfanew));
-    IMAGE_OPTIONAL_HEADER* opt_header = &nt->OptionalHeader;
-
-    if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+    const unsigned char* dll_binary = reinterpret_cast<const unsigned char*>(dll_data.get());
+    pe::pe_headers disk_headers = pe::resolve_pe_headers((void*)dll_binary);
+    if (disk_headers.nt_headers->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
         container::error_handler("[-] invalid pe type");
     }
 
-    size_t size_of_image = nt->OptionalHeader.SizeOfImage;
-    size_t size_of_headers = nt->OptionalHeader.SizeOfHeaders;
-    uintptr_t image_base_preferred = nt->OptionalHeader.ImageBase;
-    uintptr_t delta = (uintptr_t)allocation - image_base_preferred;
-
-
-    if (!WriteProcessMemory(hijack.retrieve_handle(), allocation, dll_data.get(), size_of_headers, nullptr)) {
-        container::error_handler("[-] couldn't write headers");
+    if (!::WriteProcessMemory(hijack.retrieve_handle(), allocation, dll_data.get(), disk_headers.optional_header->SizeOfHeaders, nullptr)) {
+        std::cout << "[-] couldn't write headers" << std::endl;
     }
 
-    IMAGE_SECTION_HEADER* section_header = IMAGE_FIRST_SECTION(nt);
-    for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section_header) {
-        if (section_header->SizeOfRawData == 0) continue;
+    auto section_header = IMAGE_FIRST_SECTION(disk_headers.nt_headers);
 
-        NTSTATUS status = nt_write_virtual_memory(hijack.retrieve_handle(), reinterpret_cast<void*>((uintptr_t)allocation + section_header->VirtualAddress), dll_data.get() + section_header->PointerToRawData, section_header->SizeOfRawData, nullptr);
-        if (!NT_SUCCESS(status)) {
-            container::error_handler("[-] failed writing section");
+    for (int i = 0; i < disk_headers.file_header->NumberOfSections; ++i, ++section_header) {
+        if (section_header->SizeOfRawData == 0)
+            continue;
+
+        if (!::WriteProcessMemory(hijack.retrieve_handle(), reinterpret_cast<void*>((uintptr_t)allocation + section_header->VirtualAddress), dll_data.get() + section_header->PointerToRawData, section_header->SizeOfRawData, nullptr)) {
+            std::cout << "[-] couldn't write section";
         }
-
         std::cout << "[+] " << section_header->Name << " patched\n";
     }
-
-    auto& reloc_dir = nt->OptionalHeader.DataDirectory[5];
-    if (reloc_dir.VirtualAddress != 0 && reloc_dir.Size != 0) {
-        const unsigned char* reloc_base = (byte*)dll_module + reloc_dir.VirtualAddress;
-        const unsigned char* reloc_end = reloc_base + reloc_dir.Size;
-        const IMAGE_BASE_RELOCATION* pblock = reinterpret_cast<const IMAGE_BASE_RELOCATION*>(reloc_base);
+    
+    uintptr_t delta = (uintptr_t)allocation - disk_headers.optional_header->ImageBase;
+    auto& relocation_directory = disk_headers.optional_header->DataDirectory[5];
+    if (relocation_directory.Size != 0 && relocation_directory.VirtualAddress != 0) {
+        const unsigned char* reloc_base = (byte*)dll_module + relocation_directory.VirtualAddress;
+        const unsigned char* reloc_end = reloc_base + relocation_directory.Size;
+        auto pblock = reinterpret_cast<const IMAGE_BASE_RELOCATION*>(reloc_base);
 
         while (reinterpret_cast<const unsigned char*>(pblock) < reloc_end && pblock->SizeOfBlock) {
             size_t entry_count = (pblock->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
-            const WORD* entries = reinterpret_cast<const WORD*>(pblock + 1);
+            auto entries = reinterpret_cast<const WORD*>(pblock + 1);
             uintptr_t page_rva = pblock->VirtualAddress;
 
             for (size_t i = 0; i < entry_count; ++i) {
@@ -365,27 +356,21 @@ bool manual_map(_In_ std::string_view process_window_name, _In_ const char* dll_
                     uintptr_t target_rva = page_rva + offset;
                     uintptr_t absolute_address = (uintptr_t)allocation + target_rva;
 
-                    uint64_t original_value = 0;
-                    if (target_rva + sizeof(uint64_t) <= size_of_image) {
-                        original_value = *reinterpret_cast<const uint64_t*>(file_base + target_rva);
+                    uint64_t orgininal_value = 0;
+                    if (target_rva + sizeof(uint64_t) <= disk_headers.optional_header->SizeOfImage) {
+                        orgininal_value = *reinterpret_cast<const uint64_t*>(dll_binary + target_rva);
                     }
-
-                    uint64_t patched = original_value + (uint64_t)delta;
-
-                    NTSTATUS st = nt_write_virtual_memory(hijack.retrieve_handle(), reinterpret_cast<void*>(absolute_address), &patched, sizeof(patched), nullptr);
-
-                    if (!NT_SUCCESS(st)) {
-                        container::error_handler("[-] failed writing relocation patch");
+                    uint64_t patched = orgininal_value + (uint64_t)delta;
+                    if (!::WriteProcessMemory(hijack.retrieve_handle(), reinterpret_cast<void*>(absolute_address), &patched, sizeof(patched), nullptr)) {
+                        std::cout << "[-] couldn't patch relocations";
                     }
                 }
             }
             pblock = reinterpret_cast<const IMAGE_BASE_RELOCATION*>(reinterpret_cast<const unsigned char*>(pblock) + pblock->SizeOfBlock);
         }
-
-		std::cout << "[+] relocations patched\n"; 
-
     }
-    
+
+    std::cout << "[+] relocations patched\n";
 
     auto load_dll = [&](std::string& dll_name) -> void {
         void* remote_buffer = VirtualAllocEx(hijack.retrieve_handle(), nullptr, 0x1000, MEM_COMMIT, PAGE_READWRITE);
@@ -402,7 +387,7 @@ bool manual_map(_In_ std::string_view process_window_name, _In_ const char* dll_
         std::cout << "[+] injected: " << dll_name << "\n";
         VirtualFreeEx(hijack.retrieve_handle(), remote_buffer, 0, MEM_RELEASE);
         CloseHandle(hthread);
-     };
+        };
 
     auto string_conversion = [&](void* address) -> std::string {
         std::string name = "";
@@ -425,7 +410,7 @@ bool manual_map(_In_ std::string_view process_window_name, _In_ const char* dll_
         };
 
 
-    auto import_directory = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    auto import_directory = &disk_headers.nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (!import_directory->VirtualAddress || !import_directory->Size) {
         container::error_handler("[-] no import directory found");
     }
@@ -478,7 +463,7 @@ bool manual_map(_In_ std::string_view process_window_name, _In_ const char* dll_
 
 
     std::cout << "[+] launching dll entry point\n";
-    uintptr_t entry_point = (uintptr_t)allocation + opt_header->AddressOfEntryPoint;
+    uintptr_t entry_point = (uintptr_t)allocation + disk_headers.optional_header->AddressOfEntryPoint;
 
     struct dll_stub {
         BYTE code[64];
@@ -499,7 +484,7 @@ bool manual_map(_In_ std::string_view process_window_name, _In_ const char* dll_
         }
     };
     *(uintptr_t*)(stub.code + 6) = (uintptr_t)allocation;
-    *(uintptr_t*)(stub.code + 24) = (uintptr_t)allocation + opt_header->AddressOfEntryPoint;
+    *(uintptr_t*)(stub.code + 24) = (uintptr_t)allocation + disk_headers.optional_header->AddressOfEntryPoint;
 
     void* remote_stub = VirtualAllocEx(hijack.retrieve_handle(), nullptr, sizeof(stub), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!::WriteProcessMemory(hijack.retrieve_handle(), remote_stub, &stub, sizeof(stub), nullptr)) {
@@ -518,7 +503,7 @@ bool manual_map(_In_ std::string_view process_window_name, _In_ const char* dll_
     {
         do
         {
-            if (thread_entry.th32OwnerProcessID == memory::get_process_id(process_window_name.data()))
+            if (thread_entry.th32OwnerProcessID == memory::get_process_identifier(process_window_name.data()))
             {
                 CloseHandle(snapshot);
                 thread_id = thread_entry.th32ThreadID;
@@ -534,14 +519,12 @@ bool manual_map(_In_ std::string_view process_window_name, _In_ const char* dll_
     CONTEXT ctx;
     ctx.ContextFlags = CONTEXT_FULL;
     GetThreadContext(thread_handle, &ctx);
-    
+
 
     ctx.Rip = (DWORD64)remote_stub;
     SetThreadContext(thread_handle, &ctx);
     ResumeThread(thread_handle);
-
-}
-
+};
 
 
 int main() {
